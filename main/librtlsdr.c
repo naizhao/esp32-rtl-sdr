@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #ifndef _WIN32
 #include <unistd.h>
 #define min(a, b) (((a) < (b)) ? (a) : (b))
@@ -84,8 +85,12 @@ struct rtlsdr_dev
     class_driver_t *driver_obj;
     uint32_t xfer_buf_num;
     uint32_t xfer_buf_len;
-    struct libusb_transfer **xfer;
-    unsigned char **xfer_buf;
+    /* Native ESP-IDF USB host transfer handles. The original libusb-based
+     * layout (libusb_transfer + separate user buffers) was replaced when
+     * the async path was rewritten on top of usb_host_transfer_alloc() —
+     * the DMA buffer now lives inside the transfer object itself. */
+    usb_transfer_t **xfer;
+    unsigned char **xfer_buf;  /* deprecated, kept to preserve struct layout */
     rtlsdr_read_async_cb_t cb;
     void *cb_ctx;
     enum rtlsdr_async_status async_status;
@@ -352,7 +357,11 @@ static rtlsdr_dongle_t known_devices[] = {
 };
 
 #define DEFAULT_BUF_NUMBER 15
-#define DEFAULT_BUF_LENGTH (16 * 32 * 512)
+/* Upstream/libusb default was (16 * 32 * 512) = 262144 B/URB. On the
+ * ESP32-P4 DWC2 controller, that single-URB size triggers
+ * USB_HOST_TRANSFER_ERROR / OOM. Lowered to the empirically-proven
+ * 6400 B/URB used by naizhao/xtrsdr's working P4 build. */
+#define DEFAULT_BUF_LENGTH (16 * 16 * 25)
 
 #define DEF_RTL_XTAL_FREQ 28800000
 #define MIN_RTL_XTAL_FREQ (DEF_RTL_XTAL_FREQ - 1000)
@@ -1536,302 +1545,212 @@ int rtlsdr_read_sync(rtlsdr_dev_t *dev, void *buf, int len, int *n_read)
     return esp_libusb_bulk_transfer(dev->driver_obj, 0x81, buf, len, n_read, BULK_TIMEOUT);
 }
 
-// static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *xfer)
-// {
-//     rtlsdr_dev_t *dev = (rtlsdr_dev_t *)xfer->user_data;
+/* ------------------------------------------------------------------------- *
+ *  Async streaming (ESP32-P4 native USB host port).
+ *
+ *  This replaces the upstream libusb-based async path. Buffers come from
+ *  usb_host_transfer_alloc() (DMA-capable internal RAM) and are submitted
+ *  on bulk IN endpoint 0x81. The user callback fires from whichever task
+ *  pumps usb_host_client_handle_events(). Per Pilot Kit Box SPEC red line
+ *  #3, the callback MUST stay non-blocking and MUST NOT perform DSP —
+ *  it is expected to push the raw bytes into a RingBuffer and return.
+ *
+ *  Defaults follow naizhao/xtrsdr's proven-working ESP32-P4 values:
+ *    DEFAULT_BUF_NUMBER = 15 in-flight URBs
+ *    DEFAULT_BUF_LENGTH = 6400 B/URB (matches xtrsdr librtlsdr.c)
+ *  ESP32-P4 DWC2 cannot satisfy a single 256 KiB URB the way desktop
+ *  libusb can; 6.4 KiB is empirically safe and keeps ~48 ms of pipeline
+ *  buffering at 2 MSPS.
+ * ------------------------------------------------------------------------- */
 
-//     if (LIBUSB_TRANSFER_COMPLETED == xfer->status)
-//     {
-//         if (dev->cb)
-//             dev->cb(xfer->buffer, xfer->actual_length, dev->cb_ctx);
+static const char *TAG_ASYNC = "rtlsdr_async";
 
-//         libusb_submit_transfer(xfer); /* resubmit transfer */
-//         dev->xfer_errors = 0;
-//     }
-//     else if (LIBUSB_TRANSFER_CANCELLED != xfer->status)
-//     {
-// #ifndef _WIN32
-//         if (LIBUSB_TRANSFER_ERROR == xfer->status)
-//             dev->xfer_errors++;
+static void _libusb_callback(usb_transfer_t *xfer)
+{
+    rtlsdr_dev_t *dev = (rtlsdr_dev_t *)xfer->context;
 
-//         if (dev->xfer_errors >= dev->xfer_buf_num ||
-//             LIBUSB_TRANSFER_NO_DEVICE == xfer->status)
-//         {
-// #endif
-//             dev->dev_lost = 1;
-//             rtlsdr_cancel_async(dev);
-//             fprintf(stderr, "cb transfer status: %d, "
-//                             "canceling...\n",
-//                     xfer->status);
-// #ifndef _WIN32
-//         }
-// #endif
-//     }
-// }
+    if (xfer->status == USB_TRANSFER_STATUS_COMPLETED) {
+        if (dev->cb) {
+            dev->cb(xfer->data_buffer, xfer->actual_num_bytes, dev->cb_ctx);
+        }
+        if (dev->async_status == RTLSDR_RUNNING) {
+            esp_err_t err = usb_host_transfer_submit(xfer);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG_ASYNC, "resubmit ERR=%d", err);
+            }
+        }
+        dev->xfer_errors = 0;
+        return;
+    }
 
-// int rtlsdr_wait_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx)
-// {
-//     return rtlsdr_read_async(dev, cb, ctx, 0, 0);
-// }
+    if (xfer->status != USB_TRANSFER_STATUS_CANCELED) {
+        if (xfer->status == USB_TRANSFER_STATUS_ERROR) {
+            dev->xfer_errors++;
+        }
+        if (dev->xfer_errors >= dev->xfer_buf_num ||
+            xfer->status == USB_TRANSFER_STATUS_NO_DEVICE) {
+            dev->dev_lost = 1;
+            rtlsdr_cancel_async(dev);
+            ESP_LOGW(TAG_ASYNC, "cb status=%d -> cancel", xfer->status);
+        }
+    }
+}
 
-// static int _rtlsdr_alloc_async_buffers(rtlsdr_dev_t *dev)
-// {
-//     unsigned int i;
+int rtlsdr_wait_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx)
+{
+    return rtlsdr_read_async(dev, cb, ctx, 0, 0);
+}
 
-//     if (!dev)
-//         return -1;
+static int _rtlsdr_alloc_async_buffers(rtlsdr_dev_t *dev)
+{
+    if (!dev) return -1;
+    if (dev->xfer) return 0;  /* already allocated */
 
-//     if (!dev->xfer)
-//     {
-//         dev->xfer = malloc(dev->xfer_buf_num *
-//                            sizeof(struct libusb_transfer *));
+    dev->xfer = calloc(dev->xfer_buf_num, sizeof(usb_transfer_t *));
+    if (!dev->xfer) {
+        ESP_LOGE(TAG_ASYNC, "OOM allocating xfer pointer array");
+        return -1;
+    }
 
-//         for (i = 0; i < dev->xfer_buf_num; ++i)
-//             dev->xfer[i] = libusb_alloc_transfer(0);
-//     }
+    for (uint32_t i = 0; i < dev->xfer_buf_num; ++i) {
+        esp_err_t err = usb_host_transfer_alloc(dev->xfer_buf_len, 0, &dev->xfer[i]);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG_ASYNC,
+                     "usb_host_transfer_alloc[%lu] ERR=%d (buf_len=%lu B). "
+                     "Consider reducing buf_len; ESP32-P4 DWC2 DMA caps "
+                     "single-URB size much lower than desktop libusb.",
+                     (unsigned long)i, err, (unsigned long)dev->xfer_buf_len);
+            return -1;
+        }
+        if (dev->xfer[i]->data_buffer_size < dev->xfer_buf_len) {
+            ESP_LOGE(TAG_ASYNC,
+                     "alloc[%lu] returned smaller buffer than requested (%u < %lu)",
+                     (unsigned long)i,
+                     dev->xfer[i]->data_buffer_size,
+                     (unsigned long)dev->xfer_buf_len);
+            return -1;
+        }
+    }
 
-//     if (dev->xfer_buf)
-//         return -2;
+    ESP_LOGI(TAG_ASYNC,
+             "alloc'd %lu URBs x %lu B (free internal heap: %u B)",
+             (unsigned long)dev->xfer_buf_num,
+             (unsigned long)dev->xfer_buf_len,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    return 0;
+}
 
-//     dev->xfer_buf = malloc(dev->xfer_buf_num * sizeof(unsigned char *));
-//     memset(dev->xfer_buf, 0, dev->xfer_buf_num * sizeof(unsigned char *));
+static int _rtlsdr_free_async_buffers(rtlsdr_dev_t *dev)
+{
+    if (!dev) return -1;
+    if (!dev->xfer) return 0;
 
-// #if defined(ENABLE_ZEROCOPY) && defined(__linux__) && LIBUSB_API_VERSION >= 0x01000105
-//     fprintf(stderr, "Allocating %d zero-copy buffers\n", dev->xfer_buf_num);
+    for (uint32_t i = 0; i < dev->xfer_buf_num; ++i) {
+        if (dev->xfer[i]) {
+            usb_host_transfer_free(dev->xfer[i]);
+            dev->xfer[i] = NULL;
+        }
+    }
+    free(dev->xfer);
+    dev->xfer = NULL;
+    return 0;
+}
 
-//     dev->use_zerocopy = 1;
-//     for (i = 0; i < dev->xfer_buf_num; ++i)
-//     {
-//         dev->xfer_buf[i] = libusb_dev_mem_alloc(dev->devh, dev->xfer_buf_len);
+int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
+                      uint32_t buf_num, uint32_t buf_len)
+{
+    int r = 0;
+    enum rtlsdr_async_status next_status = RTLSDR_INACTIVE;
 
-//         if (dev->xfer_buf[i])
-//         {
-//             /* Check if Kernel usbfs mmap() bug is present: if the
-//              * mapping is correct, the buffers point to memory that
-//              * was memset to 0 by the Kernel, otherwise, they point
-//              * to random memory. We check if the buffers are zeroed
-//              * and otherwise fall back to buffers in userspace.
-//              */
-//             if (dev->xfer_buf[i][0] || memcmp(dev->xfer_buf[i],
-//                                               dev->xfer_buf[i] + 1,
-//                                               dev->xfer_buf_len - 1))
-//             {
-//                 fprintf(stderr, "Detected Kernel usbfs mmap() "
-//                                 "bug, falling back to buffers "
-//                                 "in userspace\n");
-//                 dev->use_zerocopy = 0;
-//                 break;
-//             }
-//         }
-//         else
-//         {
-//             fprintf(stderr, "Failed to allocate zero-copy "
-//                             "buffer for transfer %d\nFalling "
-//                             "back to buffers in userspace\n",
-//                     i);
-//             dev->use_zerocopy = 0;
-//             break;
-//         }
-//     }
+    if (!dev) return -1;
+    if (RTLSDR_INACTIVE != dev->async_status) return -2;
 
-//     /* zero-copy buffer allocation failed (partially or completely)
-//      * we need to free the buffers again if already allocated */
-//     if (!dev->use_zerocopy)
-//     {
-//         for (i = 0; i < dev->xfer_buf_num; ++i)
-//         {
-//             if (dev->xfer_buf[i])
-//                 libusb_dev_mem_free(dev->devh,
-//                                     dev->xfer_buf[i],
-//                                     dev->xfer_buf_len);
-//         }
-//     }
-// #endif
+    dev->async_status = RTLSDR_RUNNING;
+    dev->async_cancel = 0;
+    dev->cb = cb;
+    dev->cb_ctx = ctx;
+    dev->xfer_errors = 0;
 
-//     /* no zero-copy available, allocate buffers in userspace */
-//     if (!dev->use_zerocopy)
-//     {
-//         for (i = 0; i < dev->xfer_buf_num; ++i)
-//         {
-//             dev->xfer_buf[i] = malloc(dev->xfer_buf_len);
+    dev->xfer_buf_num = (buf_num > 0) ? buf_num : DEFAULT_BUF_NUMBER;
+    /* The original libusb impl required `% 512 == 0`; on ESP32-P4 we relax
+     * this to `% 64 == 0` (matches xtrsdr's working P4 build). Bulk packets
+     * are split into MPS-sized chunks by the host stack internally. */
+    dev->xfer_buf_len = (buf_len > 0 && (buf_len % 64) == 0)
+                            ? buf_len
+                            : DEFAULT_BUF_LENGTH;
 
-//             if (!dev->xfer_buf[i])
-//                 return -ENOMEM;
-//         }
-//     }
+    ESP_LOGI(TAG_ASYNC,
+             "starting async stream: %lu URBs x %lu B on EP 0x81",
+             (unsigned long)dev->xfer_buf_num,
+             (unsigned long)dev->xfer_buf_len);
 
-//     return 0;
-// }
+    if (_rtlsdr_alloc_async_buffers(dev) != 0) {
+        ESP_LOGE(TAG_ASYNC, "buffer alloc failed -> canceling");
+        dev->async_status = RTLSDR_CANCELING;
+    } else {
+        for (uint32_t i = 0; i < dev->xfer_buf_num; ++i) {
+            usb_transfer_t *xfer = dev->xfer[i];
+            xfer->callback = _libusb_callback;
+            xfer->bEndpointAddress = 0x81;
+            xfer->context = dev;
+            xfer->num_bytes = dev->xfer_buf_len;
+            xfer->device_handle = dev->driver_obj->dev_hdl;
+            xfer->timeout_ms = BULK_TIMEOUT;
 
-// static int _rtlsdr_free_async_buffers(rtlsdr_dev_t *dev)
-// {
-//     unsigned int i;
+            esp_err_t err = usb_host_transfer_submit(xfer);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG_ASYNC, "submit[%lu] ERR=%d",
+                         (unsigned long)i, err);
+                dev->async_status = RTLSDR_CANCELING;
+                r = err;
+                break;
+            }
+        }
+    }
 
-//     if (!dev)
-//         return -1;
+    /* This function blocks until rtlsdr_cancel_async() is called. We are
+     * deliberately the sole pump for usb_host_client_handle_events() during
+     * streaming, so the per-URB completion callbacks dispatch *on this task*
+     * (per ESP-IDF docs the callback runs in the context of the task that
+     * called handle_events). This keeps the architecture single-task and
+     * avoids contending with naizhao's esp_libusb_control_transfer(), which
+     * also pumps events inline.
+     *
+     * Pumping is intentional here even though we are "blocking" — the
+     * timeout-bounded handle_events() call yields whenever there is no
+     * pending event, so the watchdog stays happy. */
+    while (RTLSDR_INACTIVE != dev->async_status) {
+        if (RTLSDR_CANCELING == dev->async_status) {
+            next_status = RTLSDR_INACTIVE;
+            if (dev->xfer) {
+                ESP_LOGI(TAG_ASYNC, "halt/flush/clear ep 0x81");
+                usb_host_endpoint_halt(dev->driver_obj->dev_hdl, 0x81);
+                usb_host_endpoint_flush(dev->driver_obj->dev_hdl, 0x81);
+                /* Drain canceled-transfer callbacks so the transfers leave
+                 * the in-flight state before we usb_host_transfer_free()
+                 * them. ~200 ms is comfortably more than the worst-case
+                 * USB cancellation latency. */
+                TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(200);
+                while ((int32_t)(deadline - xTaskGetTickCount()) > 0) {
+                    usb_host_client_handle_events(dev->driver_obj->client_hdl,
+                                                  pdMS_TO_TICKS(50));
+                }
+                usb_host_endpoint_clear(dev->driver_obj->dev_hdl, 0x81);
+            }
+            break;
+        }
+        /* Block up to 100 ms waiting for the next URB completion. The
+         * registered _libusb_callback fires synchronously from inside this
+         * call, pushes the IQ chunk into the user-supplied callback, and
+         * resubmits the transfer. */
+        usb_host_client_handle_events(dev->driver_obj->client_hdl,
+                                      pdMS_TO_TICKS(100));
+    }
 
-//     if (dev->xfer)
-//     {
-//         for (i = 0; i < dev->xfer_buf_num; ++i)
-//         {
-//             if (dev->xfer[i])
-//             {
-//                 libusb_free_transfer(dev->xfer[i]);
-//             }
-//         }
-
-//         free(dev->xfer);
-//         dev->xfer = NULL;
-//     }
-
-//     if (dev->xfer_buf)
-//     {
-//         for (i = 0; i < dev->xfer_buf_num; ++i)
-//         {
-//             if (dev->xfer_buf[i])
-//             {
-//                 if (dev->use_zerocopy)
-//                 {
-// #if defined(__linux__) && LIBUSB_API_VERSION >= 0x01000105
-//                     libusb_dev_mem_free(dev->devh,
-//                                         dev->xfer_buf[i],
-//                                         dev->xfer_buf_len);
-// #endif
-//                 }
-//                 else
-//                 {
-//                     free(dev->xfer_buf[i]);
-//                 }
-//             }
-//         }
-
-//         free(dev->xfer_buf);
-//         dev->xfer_buf = NULL;
-//     }
-
-//     return 0;
-// }
-
-// int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
-//                       uint32_t buf_num, uint32_t buf_len)
-// {
-//     unsigned int i;
-//     int r = 0;
-//     struct timeval tv = {1, 0};
-//     struct timeval zerotv = {0, 0};
-//     enum rtlsdr_async_status next_status = RTLSDR_INACTIVE;
-
-//     if (!dev)
-//         return -1;
-
-//     if (RTLSDR_INACTIVE != dev->async_status)
-//         return -2;
-
-//     dev->async_status = RTLSDR_RUNNING;
-//     dev->async_cancel = 0;
-
-//     dev->cb = cb;
-//     dev->cb_ctx = ctx;
-
-//     if (buf_num > 0)
-//         dev->xfer_buf_num = buf_num;
-//     else
-//         dev->xfer_buf_num = DEFAULT_BUF_NUMBER;
-
-//     if (buf_len > 0 && buf_len % 512 == 0) /* len must be multiple of 512 */
-//         dev->xfer_buf_len = buf_len;
-//     else
-//         dev->xfer_buf_len = DEFAULT_BUF_LENGTH;
-
-//     _rtlsdr_alloc_async_buffers(dev);
-
-//     for (i = 0; i < dev->xfer_buf_num; ++i)
-//     {
-//         libusb_fill_bulk_transfer(dev->xfer[i],
-//                                   dev->devh,
-//                                   0x81,
-//                                   dev->xfer_buf[i],
-//                                   dev->xfer_buf_len,
-//                                   _libusb_callback,
-//                                   (void *)dev,
-//                                   BULK_TIMEOUT);
-
-//         r = libusb_submit_transfer(dev->xfer[i]);
-//         if (r < 0)
-//         {
-//             fprintf(stderr, "Failed to submit transfer %i\n"
-//                             "Please increase your allowed "
-//                             "usbfs buffer size with the "
-//                             "following command:\n"
-//                             "echo 0 > /sys/module/usbcore"
-//                             "/parameters/usbfs_memory_mb\n",
-//                     i);
-//             dev->async_status = RTLSDR_CANCELING;
-//             break;
-//         }
-//     }
-
-//     while (RTLSDR_INACTIVE != dev->async_status)
-//     {
-//         r = libusb_handle_events_timeout_completed(dev->ctx, &tv,
-//                                                    &dev->async_cancel);
-//         if (r < 0)
-//         {
-//             /*fprintf(stderr, "handle_events returned: %d\n", r);*/
-//             if (r == LIBUSB_ERROR_INTERRUPTED) /* stray signal */
-//                 continue;
-//             break;
-//         }
-
-//         if (RTLSDR_CANCELING == dev->async_status)
-//         {
-//             next_status = RTLSDR_INACTIVE;
-
-//             if (!dev->xfer)
-//                 break;
-
-//             for (i = 0; i < dev->xfer_buf_num; ++i)
-//             {
-//                 if (!dev->xfer[i])
-//                     continue;
-
-//                 if (LIBUSB_TRANSFER_CANCELLED !=
-//                     dev->xfer[i]->status)
-//                 {
-//                     r = libusb_cancel_transfer(dev->xfer[i]);
-//                     /* handle events after canceling
-//                      * to allow transfer status to
-//                      * propagate */
-// #ifdef _WIN32
-//                     Sleep(1);
-// #endif
-//                     libusb_handle_events_timeout_completed(dev->ctx,
-//                                                            &zerotv, NULL);
-//                     if (r < 0)
-//                         continue;
-
-//                     next_status = RTLSDR_CANCELING;
-//                 }
-//             }
-
-//             if (dev->dev_lost || RTLSDR_INACTIVE == next_status)
-//             {
-//                 /* handle any events that still need to
-//                  * be handled before exiting after we
-//                  * just cancelled all transfers */
-//                 libusb_handle_events_timeout_completed(dev->ctx,
-//                                                        &zerotv, NULL);
-//                 break;
-//             }
-//         }
-//     }
-
-//     _rtlsdr_free_async_buffers(dev);
-
-//     dev->async_status = next_status;
-
-//     return r;
-// }
+    _rtlsdr_free_async_buffers(dev);
+    dev->async_status = next_status;
+    return r;
+}
 
 int rtlsdr_cancel_async(rtlsdr_dev_t *dev)
 {
