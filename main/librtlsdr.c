@@ -359,9 +359,16 @@ static rtlsdr_dongle_t known_devices[] = {
 #define DEFAULT_BUF_NUMBER 15
 /* Upstream/libusb default was (16 * 32 * 512) = 262144 B/URB. On the
  * ESP32-P4 DWC2 controller, that single-URB size triggers
- * USB_HOST_TRANSFER_ERROR / OOM. Lowered to the empirically-proven
- * 6400 B/URB used by naizhao/xtrsdr's working P4 build. */
-#define DEFAULT_BUF_LENGTH (16 * 16 * 25)
+ * USB_HOST_TRANSFER_ERROR / OOM.
+ *
+ * On ESP32-P4 (USB 2.0 High-Speed), bulk endpoint MPS = 512 bytes,
+ * and ESP-IDF's USB host enforces that IN-transfer length be an
+ * integer multiple of MPS. The naizhao/xtrsdr fork shipped 6400
+ * (= 16 * 16 * 25) which is FS-aligned (6400 / 64 = 100) but NOT
+ * HS-aligned (6400 / 512 = 12.5). Bumped to 6144 (= 12 * 512),
+ * still well below the heap headroom we observed and a clean
+ * multiple of MPS on both HS and FS. */
+#define DEFAULT_BUF_LENGTH (12 * 512)
 
 #define DEF_RTL_XTAL_FREQ 28800000
 #define MIN_RTL_XTAL_FREQ (DEF_RTL_XTAL_FREQ - 1000)
@@ -1386,66 +1393,63 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint8_t index, usb_host_client_handle_t 
     /* Probe tuners */
     rtlsdr_set_i2c_repeater(dev, 1);
 
-    // reg = rtlsdr_i2c_read_reg(dev, E4K_I2C_ADDR, E4K_CHECK_ADDR);
-    // fprintf(stderr, "rtlsdr_i2c_read_reg E4K_I2C_ADDR setting done\n");
-    // if (reg == E4K_CHECK_VAL)
-    // {
-    //     fprintf(stderr, "Found Elonics E4000 tuner\n");
-    //     dev->tuner_type = RTLSDR_TUNER_E4000;
-    //     goto found;
-    // }
+    /* Upstream-style probe order: try every tuner in turn, first
+     * hit wins. The naizhao P4 fork originally only enabled R820T
+     * because that's all the early dev kit shipped with. ADS-B
+     * receivers in the wild also use Fitipower FC0012/FC0013 (and
+     * occasionally Elonics E4000); they all probe cleanly over the
+     * RTL2832U's I2C bridge so there's no cost to re-enabling them. */
 
-    // reg = rtlsdr_i2c_read_reg(dev, FC0013_I2C_ADDR, FC0013_CHECK_ADDR);
-    // fprintf(stderr, "rtlsdr_i2c_read_reg FC0013_I2C_ADDR setting done\n");
-    // if (reg == FC0013_CHECK_VAL)
-    // {
-    //     fprintf(stderr, "Found Fitipower FC0013 tuner\n");
-    //     dev->tuner_type = RTLSDR_TUNER_FC0013;
-    //     goto found;
-    // }
+    reg = rtlsdr_i2c_read_reg(dev, E4K_I2C_ADDR, E4K_CHECK_ADDR);
+    if (reg == E4K_CHECK_VAL) {
+        fprintf(stderr, "Found Elonics E4000 tuner\n");
+        dev->tuner_type = RTLSDR_TUNER_E4000;
+        goto found;
+    }
+
+    reg = rtlsdr_i2c_read_reg(dev, FC0013_I2C_ADDR, FC0013_CHECK_ADDR);
+    if (reg == FC0013_CHECK_VAL) {
+        fprintf(stderr, "Found Fitipower FC0013 tuner\n");
+        dev->tuner_type = RTLSDR_TUNER_FC0013;
+        goto found;
+    }
 
     reg = rtlsdr_i2c_read_reg(dev, R820T_I2C_ADDR, R82XX_CHECK_ADDR);
     ESP_LOGI(TAG_ADSB, "rtl device number %d", reg);
     fprintf(stderr, "rtlsdr_i2c_read_reg R82XX_CHECK_ADDR setting done\n");
-    if (reg == R82XX_CHECK_VAL)
-    {
+    if (reg == R82XX_CHECK_VAL) {
         fprintf(stderr, "Found Rafael Micro R820T tuner\n");
         dev->tuner_type = RTLSDR_TUNER_R820T;
         goto found;
     }
 
-    // reg = rtlsdr_i2c_read_reg(dev, R828D_I2C_ADDR, R82XX_CHECK_ADDR);
-    // fprintf(stderr, "rtlsdr_i2c_read_reg R828D_I2C_ADDR setting done\n");
-    // if (reg == R82XX_CHECK_VAL)
-    // {
-    //     fprintf(stderr, "Found Rafael Micro R828D tuner\n");
-    //     dev->tuner_type = RTLSDR_TUNER_R828D;
-    //     goto found;
-    // }
+    reg = rtlsdr_i2c_read_reg(dev, R828D_I2C_ADDR, R82XX_CHECK_ADDR);
+    if (reg == R82XX_CHECK_VAL) {
+        fprintf(stderr, "Found Rafael Micro R828D tuner\n");
+        dev->tuner_type = RTLSDR_TUNER_R828D;
+        goto found;
+    }
 
-    // /* initialise GPIOs */
-    // rtlsdr_set_gpio_output(dev, 4);
+    /* FC2580 and FC0012 sit behind a tuner reset GPIO — reset before
+     * probing so they don't latch a stale state from a previous run. */
+    rtlsdr_set_gpio_output(dev, 4);
+    rtlsdr_set_gpio_bit(dev, 4, 1);
+    rtlsdr_set_gpio_bit(dev, 4, 0);
 
-    // /* reset tuner before probing */
-    // rtlsdr_set_gpio_bit(dev, 4, 1);
-    // rtlsdr_set_gpio_bit(dev, 4, 0);
+    reg = rtlsdr_i2c_read_reg(dev, FC2580_I2C_ADDR, FC2580_CHECK_ADDR);
+    if ((reg & 0x7f) == FC2580_CHECK_VAL) {
+        fprintf(stderr, "Found FCI 2580 tuner\n");
+        dev->tuner_type = RTLSDR_TUNER_FC2580;
+        goto found;
+    }
 
-    // reg = rtlsdr_i2c_read_reg(dev, FC2580_I2C_ADDR, FC2580_CHECK_ADDR);
-    // if ((reg & 0x7f) == FC2580_CHECK_VAL)
-    // {
-    //     fprintf(stderr, "Found FCI 2580 tuner\n");
-    //     dev->tuner_type = RTLSDR_TUNER_FC2580;
-    //     goto found;
-    // }
-
-    // reg = rtlsdr_i2c_read_reg(dev, FC0012_I2C_ADDR, FC0012_CHECK_ADDR);
-    // if (reg == FC0012_CHECK_VAL)
-    // {
-    //     fprintf(stderr, "Found Fitipower FC0012 tuner\n");
-    //     rtlsdr_set_gpio_output(dev, 6);
-    //     dev->tuner_type = RTLSDR_TUNER_FC0012;
-    //     goto found;
-    // }
+    reg = rtlsdr_i2c_read_reg(dev, FC0012_I2C_ADDR, FC0012_CHECK_ADDR);
+    if (reg == FC0012_CHECK_VAL) {
+        fprintf(stderr, "Found Fitipower FC0012 tuner\n");
+        rtlsdr_set_gpio_output(dev, 6);
+        dev->tuner_type = RTLSDR_TUNER_FC0012;
+        goto found;
+    }
 
 found:
     /* use the rtl clock value by default */
