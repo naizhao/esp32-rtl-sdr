@@ -1,8 +1,11 @@
 # esp32-rtl-sdr (naizhao fork)
 
+🌐 Official Website: **[air.club](https://air.club)**
+
 Fork of [kvhnuke/esp32-rtl-sdr](https://github.com/kvhnuke/esp32-rtl-sdr) used
 as a git submodule by the **[Pilot-Kit-Box-ESP32-P4](https://github.com/naizhao/Pilot-Kit-Box-ESP32-P4)**
-firmware.
+firmware — part of the [air.club](https://air.club) Pilot Kit avionics
+ecosystem.
 
 ## ⚠ Active branch lives elsewhere
 
