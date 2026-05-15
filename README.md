@@ -3,9 +3,12 @@
 
 > ## Branch: `pilot-kit-box-esp32p4`
 >
+> 🌐 Official Website: **[air.club](https://air.club)**
+>
 > **This is the long-lived integration branch consumed as a git submodule by the
 > [Pilot-Kit-Box-ESP32-P4](https://github.com/naizhao/Pilot-Kit-Box-ESP32-P4)
-> firmware.** It is *not* a short-lived feature branch — point your submodule
+> firmware** — part of the [air.club](https://air.club) Pilot Kit avionics
+> ecosystem. It is *not* a short-lived feature branch — point your submodule
 > here for any new work that targets the Waveshare ESP32-P4-WIFI6 board.
 >
 > Delta against upstream `main`:
