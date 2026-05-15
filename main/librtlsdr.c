@@ -1379,31 +1379,28 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint8_t index, usb_host_client_handle_t 
     dev->driver_obj = driver_obj;
     init_adsb_dev();
 
-    /* Re-open recovery: on a reconnect after physical unplug the dongle's
-     * EP 0 (default control pipe) sometimes lands in a halted state. The
-     * first few vendor writes then return STALL, init_baseband silently
-     * fails on a number of register writes, and the demod ends up
-     * half-configured — visible later as a healthy 4 MB/s USB stream
-     * carrying meaningless bytes (no ADS-B preambles, msgs/s=0 forever).
-     *
-     * Clear EP 0 prophylactically and pause a beat to let the RTL2832U
-     * settle before we start poking vendor registers. Cheap insurance;
-     * no-op on a fresh power-on where the endpoint was never halted. */
-    (void)usb_host_endpoint_clear(driver_obj->dev_hdl, 0x00);
+    /* Re-open quirk: when the dongle was already streaming under the
+     * previous session (firmware reflash with cable attached, or a hot
+     * replug after physical unplug), the first vendor write to USB_SYSCTL
+     * often comes back as a USB STALL — the RTL2832U's USB front-end is
+     * still in "configured/streaming" state from before and hasn't yet
+     * reset its EP 0 default handlers. Pause briefly, then retry up to
+     * 3 times. Cheap, no-op on a true cold attach. (`usb_host_endpoint_clear`
+     * tempting here, but it only works on bulk/interrupt EPs claimed via
+     * usb_host_interface_claim; calling it on EP 0 just logs
+     * ESP_ERR_INVALID_ARG.) */
     vTaskDelay(pdMS_TO_TICKS(50));
-
-    /* Dummy write to confirm the control endpoint is alive. If it still
-     * STALLs, clear EP 0 again and retry once — that catches the case
-     * where the endpoint halted again between our clear and the write. */
-    if (rtlsdr_write_reg(dev, USBB, USB_SYSCTL, 0x09, 1) < 0) {
-        ESP_LOGW("rtlsdr",
-                 "initial vendor write STALLed — clearing EP 0 and retrying");
-        (void)usb_host_endpoint_clear(driver_obj->dev_hdl, 0x00);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        if (rtlsdr_write_reg(dev, USBB, USB_SYSCTL, 0x09, 1) < 0) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (rtlsdr_write_reg(dev, USBB, USB_SYSCTL, 0x09, 1) >= 0) break;
+        if (attempt < 2) {
+            ESP_LOGW("rtlsdr",
+                     "initial vendor write attempt %d STALLed — retrying",
+                     attempt + 1);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        } else {
             ESP_LOGE("rtlsdr",
-                     "dongle unresponsive after EP 0 clear — open will "
-                     "likely produce a half-initialized device");
+                     "initial vendor write failed after 3 attempts; "
+                     "init_baseband may end up half-configured");
         }
     }
     ESP_ERROR_CHECK(usb_host_interface_claim(dev->driver_obj->client_hdl, dev->driver_obj->dev_hdl, 0, 0));
