@@ -1,3 +1,5 @@
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "usb/usb_host.h"
 #include "esp_log.h"
 #include "esp_libusb.h"
@@ -99,47 +101,72 @@ int esp_libusb_bulk_transfer(class_driver_t *driver_obj, unsigned char endpoint,
 
 int esp_libusb_control_transfer(class_driver_t *driver_obj, uint8_t bm_req_type, uint8_t b_request, uint16_t wValue, uint16_t wIndex, unsigned char *data, uint16_t wLength, unsigned int timeout)
 {
-    ESP_ERROR_CHECK(usb_host_transfer_free(adsbdev->transfer));
-    free(adsbdev->response_buf);
-    size_t sizePacket = sizeof(usb_setup_packet_t) + wLength;
-    usb_host_transfer_alloc(sizePacket, 0, &adsbdev->transfer);
-    USB_SETUP_PACKET_INIT_CONTROL((usb_setup_packet_t *)adsbdev->transfer->data_buffer, bm_req_type, b_request, wValue, wIndex, wLength);
-    adsbdev->transfer->num_bytes = sizePacket;
-    adsbdev->transfer->device_handle = driver_obj->dev_hdl;
-    adsbdev->transfer->timeout_ms = timeout;
-    adsbdev->transfer->context = (void *)&driver_obj;
-    adsbdev->transfer->callback = transfer_read_cb;
-    adsbdev->is_done = false;
-    adsbdev->response_buf = calloc(sizePacket, sizeof(uint8_t));
+    /* Up to 3 attempts total: ESP-IDF's USB host stack will log every
+     * STALL response on EP 0 to the console (`USBH: Dev N EP 0 STALL`),
+     * but on a freshly re-opened RTL2832U the first one or two vendor
+     * writes routinely STALL while the chip's USB front-end finishes
+     * settling. Without an outer retry here, those failures silently
+     * propagate up through rtlsdr_write_reg into rtlsdr_init_baseband
+     * — which ignores every per-write return value — leaving the
+     * demod half-configured and ADS-B decoding broken until the next
+     * reboot. A small inter-attempt delay gives the dongle time to
+     * land in its default state. */
+    const int   max_attempts = 3;
+    const int   inter_attempt_delay_ms = 5;
+    size_t      sizePacket = sizeof(usb_setup_packet_t) + wLength;
 
-    if (bm_req_type == CTRL_OUT)
-    {
-        for (uint8_t i = 0; i < wLength; i++)
-        {
-            adsbdev->transfer->data_buffer[sizeof(usb_setup_packet_t) + i] = data[i];
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        ESP_ERROR_CHECK(usb_host_transfer_free(adsbdev->transfer));
+        free(adsbdev->response_buf);
+        adsbdev->response_buf = NULL;
+        adsbdev->transfer = NULL;
+
+        usb_host_transfer_alloc(sizePacket, 0, &adsbdev->transfer);
+        USB_SETUP_PACKET_INIT_CONTROL((usb_setup_packet_t *)adsbdev->transfer->data_buffer, bm_req_type, b_request, wValue, wIndex, wLength);
+        adsbdev->transfer->num_bytes      = sizePacket;
+        adsbdev->transfer->device_handle  = driver_obj->dev_hdl;
+        adsbdev->transfer->timeout_ms     = timeout;
+        adsbdev->transfer->context        = (void *)&driver_obj;
+        adsbdev->transfer->callback       = transfer_read_cb;
+        adsbdev->is_done                  = false;
+        adsbdev->response_buf             = calloc(sizePacket, sizeof(uint8_t));
+
+        if (bm_req_type == CTRL_OUT) {
+            for (uint8_t i = 0; i < wLength; i++) {
+                adsbdev->transfer->data_buffer[sizeof(usb_setup_packet_t) + i] = data[i];
+            }
         }
-    }
-    esp_err_t r = usb_host_transfer_submit_control(driver_obj->client_hdl, adsbdev->transfer);
-    if (r != ESP_OK)
-    {
-        ESP_LOGI(TAG_ADSB, "libusb_control_transfer failed with %d", r);
-        return -1;
-    }
 
-    while (!adsbdev->is_done)
-    {
-        usb_host_client_handle_events(driver_obj->client_hdl, portMAX_DELAY);
+        esp_err_t r = usb_host_transfer_submit_control(driver_obj->client_hdl, adsbdev->transfer);
+        if (r != ESP_OK) {
+            if (attempt + 1 < max_attempts) {
+                vTaskDelay(pdMS_TO_TICKS(inter_attempt_delay_ms));
+                continue;
+            }
+            ESP_LOGI(TAG_ADSB, "libusb_control_transfer failed with %d after %d attempts", r, attempt + 1);
+            return -1;
+        }
+
+        while (!adsbdev->is_done) {
+            usb_host_client_handle_events(driver_obj->client_hdl, portMAX_DELAY);
+        }
+
+        if (!adsbdev->is_success) {
+            if (attempt + 1 < max_attempts) {
+                vTaskDelay(pdMS_TO_TICKS(inter_attempt_delay_ms));
+                continue;
+            }
+            ESP_LOGI(TAG_ADSB, "libusb_control_transfer failed after %d attempts", attempt + 1);
+            return -1;
+        }
+
+        /* Success — copy IN data back and return. */
+        for (uint8_t i = 0; i < wLength; i++) {
+            data[i] = adsbdev->response_buf[sizeof(usb_setup_packet_t) + i];
+        }
+        return adsbdev->bytes_transferred;
     }
-    if (!adsbdev->is_success)
-    {
-        ESP_LOGI(TAG_ADSB, "libusb_control_transfer failed");
-        return -1;
-    }
-    for (uint8_t i = 0; i < wLength; i++)
-    {
-        data[i] = adsbdev->response_buf[sizeof(usb_setup_packet_t) + i];
-    }
-    return adsbdev->bytes_transferred;
+    return -1;  /* unreachable */
 }
 
 void esp_libusb_get_string_descriptor_ascii(const usb_str_desc_t *str_desc, char *str)
