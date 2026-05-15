@@ -1378,11 +1378,33 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint8_t index, usb_host_client_handle_t 
     ESP_ERROR_CHECK(usb_host_device_open(driver_obj->client_hdl, index, &driver_obj->dev_hdl));
     dev->driver_obj = driver_obj;
     init_adsb_dev();
-    /* perform a dummy write, if it fails, reset the device */
-    if (rtlsdr_write_reg(dev, USBB, USB_SYSCTL, 0x09, 1) < 0)
-    {
-        fprintf(stderr, "Resetting device...\n");
-        // libusb_reset_device(dev->devh);
+
+    /* Re-open recovery: on a reconnect after physical unplug the dongle's
+     * EP 0 (default control pipe) sometimes lands in a halted state. The
+     * first few vendor writes then return STALL, init_baseband silently
+     * fails on a number of register writes, and the demod ends up
+     * half-configured — visible later as a healthy 4 MB/s USB stream
+     * carrying meaningless bytes (no ADS-B preambles, msgs/s=0 forever).
+     *
+     * Clear EP 0 prophylactically and pause a beat to let the RTL2832U
+     * settle before we start poking vendor registers. Cheap insurance;
+     * no-op on a fresh power-on where the endpoint was never halted. */
+    (void)usb_host_endpoint_clear(driver_obj->dev_hdl, 0x00);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    /* Dummy write to confirm the control endpoint is alive. If it still
+     * STALLs, clear EP 0 again and retry once — that catches the case
+     * where the endpoint halted again between our clear and the write. */
+    if (rtlsdr_write_reg(dev, USBB, USB_SYSCTL, 0x09, 1) < 0) {
+        ESP_LOGW("rtlsdr",
+                 "initial vendor write STALLed — clearing EP 0 and retrying");
+        (void)usb_host_endpoint_clear(driver_obj->dev_hdl, 0x00);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (rtlsdr_write_reg(dev, USBB, USB_SYSCTL, 0x09, 1) < 0) {
+            ESP_LOGE("rtlsdr",
+                     "dongle unresponsive after EP 0 clear — open will "
+                     "likely produce a half-initialized device");
+        }
     }
     ESP_ERROR_CHECK(usb_host_interface_claim(dev->driver_obj->client_hdl, dev->driver_obj->dev_hdl, 0, 0));
     dev->rtl_xtal = DEF_RTL_XTAL_FREQ;

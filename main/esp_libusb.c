@@ -6,6 +6,19 @@ static class_adsb_dev *adsbdev;
 
 void init_adsb_dev()
 {
+    /* Idempotent across reconnects: rtlsdr_open calls this on every
+     * attach. Without the free below, every hot-plug cycle leaked a
+     * class_adsb_dev struct (~32 B) plus its pending transfer (~6 KB),
+     * and — worse — any in-flight URB completion callback would write
+     * its result fields into freed memory once we overwrote adsbdev. */
+    if (adsbdev) {
+        if (adsbdev->transfer) {
+            usb_host_transfer_free(adsbdev->transfer);
+            adsbdev->transfer = NULL;
+        }
+        free(adsbdev->response_buf);
+        free(adsbdev);
+    }
     adsbdev = calloc(1, sizeof(class_adsb_dev));
     adsbdev->is_adsb = true;
 }
