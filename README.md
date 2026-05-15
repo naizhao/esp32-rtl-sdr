@@ -1,6 +1,29 @@
 | Supported Targets | ESP32-P4 | ESP32-S2 | ESP32-S3 |
 | ----------------- | -------- | -------- | -------- |
 
+> ## Branch: `pilot-kit-box-esp32p4`
+>
+> **This is the long-lived integration branch consumed as a git submodule by the
+> [Pilot-Kit-Box-ESP32-P4](https://github.com/naizhao/Pilot-Kit-Box-ESP32-P4)
+> firmware.** It is *not* a short-lived feature branch — point your submodule
+> here for any new work that targets the Waveshare ESP32-P4-WIFI6 board.
+>
+> Delta against upstream `main`:
+>
+> - Restructured into a pure ESP-IDF component (consumable via `EXTRA_COMPONENT_DIRS`).
+> - Async IQ streaming path ported to the ESP32-P4 USB Host stack (`rtlsdr_read_async()` runs the URB completion callback on the caller's task, no DSP in the ISR/USB callback context).
+> - RTL2832U + **FC0013** tuner detection re-enabled in `librtlsdr.c` (upstream had it gated out).
+> - URB length aligned to USB High-Speed MPS — `DEFAULT_BUF_LENGTH = 12 * 512` (6144 B), replacing the broken 6400-byte default that produced silent stalls on HS.
+>
+> Branch history:
+>
+> - Predecessor: `feat/p4-async-iq-stream` (short-lived feature branch for the
+>   initial P4 bring-up; superseded by this branch and frozen).
+> - Predecessor: `esp32p4` (earlier exploratory branch from upstream
+>   `kvhnuke` work; superseded).
+>
+> Open PRs / new work touching the P4 path should land **here**.
+
 # USB Host Library Example
 
 (See the README.md file in the upper level 'examples' directory for more information about examples.)
