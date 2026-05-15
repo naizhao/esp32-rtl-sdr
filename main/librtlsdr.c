@@ -1495,38 +1495,40 @@ found:
 
 int rtlsdr_close(rtlsdr_dev_t *dev)
 {
-    //     if (!dev)
-    //         return -1;
+    if (!dev) return -1;
 
-    //     if (!dev->dev_lost)
-    //     {
-    //         /* block until all async operations have been completed (if any) */
-    //         while (RTLSDR_INACTIVE != dev->async_status)
-    //         {
-    //             usleep(1000);
-    //         }
+    /* If the async stream is somehow still active (caller closed before
+     * we observed the cancel), nudge it and let read_async observe the
+     * flag and tear down its URBs before we tear down the USB device. */
+    if (dev->async_status != RTLSDR_INACTIVE) {
+        rtlsdr_cancel_async(dev);
+        for (int i = 0; i < 50 && dev->async_status != RTLSDR_INACTIVE; ++i) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
 
-    //         rtlsdr_deinit_baseband(dev);
-    //     }
-
-    //     libusb_release_interface(dev->devh, 0);
-
-    // #ifdef DETACH_KERNEL_DRIVER
-    //     if (dev->driver_active)
-    //     {
-    //         if (!libusb_attach_kernel_driver(dev->devh, 0))
-    //             fprintf(stderr, "Reattached kernel driver\n");
-    //         else
-    //             fprintf(stderr, "Reattaching kernel driver failed!\n");
-    //     }
-    // #endif
-
-    //     libusb_close(dev->devh);
-
-    //     libusb_exit(dev->ctx);
-
-    //     free(dev);
-
+    /* Release the USB host resources we acquired in rtlsdr_open. Order
+     * matters: release interface before closing the device handle.
+     *
+     * Without this, every disconnect leaks one USB device handle plus
+     * the interface claim. The USB host stack then refuses to fire
+     * USB_HOST_CLIENT_EVENT_NEW_DEV on the next attach because the
+     * client still appears to "own" the previous device — hot-plug
+     * silently fails and sdr_task waits forever for a NEW_DEV that
+     * will never arrive. */
+    if (dev->driver_obj) {
+        if (dev->driver_obj->dev_hdl) {
+            /* Both calls are best-effort: on physical unplug the device
+             * is already gone and the host stack will return an error,
+             * but the internal bookkeeping still gets cleaned up. */
+            usb_host_interface_release(dev->driver_obj->client_hdl,
+                                       dev->driver_obj->dev_hdl, 0);
+            usb_host_device_close(dev->driver_obj->client_hdl,
+                                  dev->driver_obj->dev_hdl);
+        }
+        free(dev->driver_obj);
+    }
+    free(dev);
     return 0;
 }
 
